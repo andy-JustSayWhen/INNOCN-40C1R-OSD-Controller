@@ -10,6 +10,7 @@
 // ============================================================================
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.Runtime.InteropServices;
@@ -56,6 +57,45 @@ namespace MonitorOSD
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
             public string szDevice;
         }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct DEVMODE
+        {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+            public short dmSpecVersion;
+            public short dmDriverVersion;
+            public short dmSize;
+            public short dmDriverExtra;
+            public int dmFields;
+            public int dmOrientation;
+            public int dmPaperSize;
+            public int dmPaperLength;
+            public int dmPaperWidth;
+            public int dmScale;
+            public short dmColor;
+            public short dmDuplex;
+            public short dmYResolution;
+            public short dmTTOption;
+            public short dmCollate;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+            public short dmLogPixels;
+            public int dmBitsPerPel;
+            public int dmPelsWidth;
+            public int dmPelsHeight;
+            public int dmDisplayFlags;
+            public int dmDisplayFrequency;
+            public int dmICMMethod;
+            public int dmICMIntent;
+            public int dmMediaType;
+            public int dmDitherType;
+            public int dmReserved1;
+            public int dmReserved2;
+            public int dmPanningWidth;
+            public int dmPanningHeight;
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
 
         [DllImport("user32.dll")]
         public static extern bool SetProcessDPIAware();
@@ -453,8 +493,8 @@ namespace MonitorOSD
 
     internal class MainForm : Form
     {
-        private static readonly byte[] SectionCommon = new byte[] { 0x10, 0x12, 0x60, 0xDC, 0x14, 0x3E, 0xAA, 0xD6 };
-        private static readonly byte[] SectionImage = new byte[] { 0xB2, 0x87, 0x16, 0x18, 0x1A, 0x52 };
+        private static readonly byte[] SectionCommon = new byte[] { 0x10, 0x12, 0x62, 0x8D, 0x60, 0xDC, 0x14, 0xAA, 0xD6 };
+        private static readonly byte[] SectionImage = new byte[] { 0xB2, 0x87, 0x16, 0x18, 0x1A, 0x6C, 0x6E, 0x70, 0x3E, 0x52 };
         private static readonly byte[] SectionReset = new byte[] { 0x05, 0x08, 0x04, 0x06, 0x1E, 0xA2 };
         private static readonly byte[] SectionInfo = new byte[] { 0xAE, 0xAC, 0xC9, 0xDF, 0xC8, 0xC6, 0xC0, 0xFD, 0xB6 };
 
@@ -463,7 +503,10 @@ namespace MonitorOSD
         private static readonly HashSet<byte> MomentaryCodes = new HashSet<byte>(
             new byte[] { 0x04, 0x05, 0x06, 0x08, 0x1E, 0xA2 });
         private static readonly HashSet<byte> SafeSliderCodes = new HashSet<byte>(
-            new byte[] { 0x10, 0x12, 0x16, 0x18, 0x1A, 0x62, 0x6C, 0x6E, 0x70, 0x87, 0xB2 });
+            new byte[] { 0x10, 0x12, 0x16, 0x18, 0x1A, 0x62, 0x6C, 0x6E, 0x70, 0x87, 0xB2, 0x3E });
+        // 未写入能力串但实测可用的码 (全量扫描发现): 音量/静音/黑电平/色温
+        private static readonly HashSet<byte> ExtraPresentCodes = new HashSet<byte>(
+            new byte[] { 0x62, 0x8D, 0x6C, 0x6E, 0x70, 0x3E });
 
         private readonly object _ddcLock = new object();
         private List<MonitorDevice> _monitors = new List<MonitorDevice>();
@@ -501,7 +544,7 @@ namespace MonitorOSD
             lbl.Margin = new Padding(3, 9, 3, 0);
             _cboMonitor = new ComboBox();
             _cboMonitor.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cboMonitor.Width = 430;
+            _cboMonitor.Width = 360;
             _cboMonitor.Margin = new Padding(3, 5, 3, 0);
             Button btnReload = new Button();
             btnReload.Text = "重新枚举";
@@ -513,6 +556,11 @@ namespace MonitorOSD
             btnRefresh.AutoSize = true;
             btnRefresh.Margin = new Padding(3, 4, 3, 0);
             btnRefresh.Click += delegate { RefreshValues(); };
+            Button btnRestoreAll = new Button();
+            btnRestoreAll.Text = "一键恢复全部";
+            btnRestoreAll.AutoSize = true;
+            btnRestoreAll.Margin = new Padding(6, 4, 3, 0);
+            btnRestoreAll.Click += delegate { RestoreAll(); };
             _cboMonitor.SelectedIndexChanged += delegate
             {
                 if (_suppress) return;
@@ -522,6 +570,7 @@ namespace MonitorOSD
             top.Controls.Add(_cboMonitor);
             top.Controls.Add(btnReload);
             top.Controls.Add(btnRefresh);
+            top.Controls.Add(btnRestoreAll);
 
             // 控件列表 (滚动区 + 表格)
             _table = new TableLayoutPanel();
@@ -553,24 +602,31 @@ namespace MonitorOSD
             TableLayoutPanel bottom = new TableLayoutPanel();
             bottom.Dock = DockStyle.Bottom;
             bottom.Height = 36;
-            bottom.ColumnCount = 2;
+            bottom.ColumnCount = 3;
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130));
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
             _status = new Label();
             _status.Dock = DockStyle.Fill;
             _status.TextAlign = ContentAlignment.MiddleLeft;
             _status.Padding = new Padding(10, 0, 0, 0);
             _status.Text = "初始化…";
+            Button btnScan = new Button();
+            btnScan.Dock = DockStyle.Fill;
+            btnScan.Text = "扫描隐藏参数";
+            btnScan.Margin = new Padding(4, 5, 2, 5);
+            btnScan.Click += delegate { ScanHidden(btnScan); };
             Button btnCaps = new Button();
             btnCaps.Dock = DockStyle.Fill;
             btnCaps.Text = "能力串详情";
-            btnCaps.Margin = new Padding(4, 5, 8, 5);
+            btnCaps.Margin = new Padding(2, 5, 8, 5);
             btnCaps.Click += delegate
             {
                 _capsBox.Height = _capsBox.Height > 0 ? 0 : 150;
             };
             bottom.Controls.Add(_status, 0, 0);
-            bottom.Controls.Add(btnCaps, 1, 0);
+            bottom.Controls.Add(btnScan, 1, 0);
+            bottom.Controls.Add(btnCaps, 2, 0);
 
             Controls.Add(_scroller);
             Controls.Add(_capsBox);
@@ -680,6 +736,13 @@ namespace MonitorOSD
             if (!dev.Vcp.TryGetValue(code, out vals) || vals == null) vals = new List<uint>();
 
             if (ReadOnlyCodes.Contains(code)) return VcpRow.KindInfo;
+            if (code == 0x8D && vals.Count < 2)
+            {
+                options = new List<UIntName>();
+                options.Add(new UIntName(1, "静音"));
+                options.Add(new UIntName(2, "取消静音"));
+                return VcpRow.KindCombo;
+            }
             if (vals.Count >= 2)
             {
                 options = new List<UIntName>();
@@ -689,6 +752,28 @@ namespace MonitorOSD
             if (vals.Count == 1 || MomentaryCodes.Contains(code)) return VcpRow.KindButton;
             if (SafeSliderCodes.Contains(code)) return VcpRow.KindSlider;
             return VcpRow.KindInfo;
+        }
+
+        // 带重试的 VCP 读取: 显示器对连续快速读取会限流, 失败时重试 2 次
+        private bool ReadVcp(MonitorDevice dev, byte code, out uint type, out uint cur, out uint max)
+        {
+            type = 0; cur = 0; max = 0;
+            if (dev == null || _closing) return false;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                lock (_ddcLock)
+                {
+                    try
+                    {
+                        type = 0; cur = 0; max = 0;
+                        if (NativeMethods.GetVCPFeatureAndVCPFeatureReply(dev.Handle, code, ref type, ref cur, ref max))
+                            return true;
+                    }
+                    catch { }
+                }
+                if (attempt < 2) System.Threading.Thread.Sleep(130);
+            }
+            return false;
         }
 
         private VcpRow BuildVcpRow(MonitorDevice dev, byte code)
@@ -704,17 +789,12 @@ namespace MonitorOSD
             if (kind == VcpRow.KindButton) return row;
 
             uint type = 0, cur = 0, max = 0;
-            bool ok = false;
-            lock (_ddcLock)
-            {
-                try { ok = NativeMethods.GetVCPFeatureAndVCPFeatureReply(dev.Handle, code, ref type, ref cur, ref max); }
-                catch { }
-            }
+            bool ok = ReadVcp(dev, code, out type, out cur, out max);
             if (kind == VcpRow.KindSlider)
             {
                 if (!ok) return null;
                 row.Current = cur;
-                row.Max = (max > 0 && max <= 100000) ? max : 100;
+                row.Max = (max > 0 && max <= 1000) ? max : 100;
                 return row;
             }
             row.Current = ok ? cur : uint.MaxValue;
@@ -746,6 +826,8 @@ namespace MonitorOSD
                 }
 
                 int done = 0;
+                byte[] sectionRestore = new byte[] { 0x05, 0x08, 0x00, 0x00 };
+                string[] sectionRestoreText = new string[] { "恢复亮度对比度", "恢复颜色默认", null, null };
                 for (int s = 0; s < sections.Length; s++)
                 {
                     if (gen != _gen || _closing) return;
@@ -762,7 +844,7 @@ namespace MonitorOSD
                         SafeUI(delegate
                         {
                             if (gen != _gen || _closing) return;
-                            if (!headerAdded) { AddHeader(sectionTitles[si]); headerAdded = true; }
+                            if (!headerAdded) { AddHeader(sectionTitles[si], sectionRestore[si], sectionRestoreText[si]); headerAdded = true; }
                             AddRow(row);
                         });
                     }
@@ -771,6 +853,7 @@ namespace MonitorOSD
                 SafeUI(delegate
                 {
                     if (gen != _gen || _closing) return;
+                    AddSystemDisplayRows(dev);
                     string sub = dev.PanelType != null && dev.PanelType.Length > 0 ? dev.PanelType.ToUpperInvariant() + "  " : "";
                     if (dev.MccsVersion != null && dev.MccsVersion.Length > 0) sub += "MCCS " + dev.MccsVersion + "  ";
                     sub += "共 " + _rows.Count + " 项控制";
@@ -789,11 +872,11 @@ namespace MonitorOSD
         {
             if (dev.Vcp.Count == 0)
                 return code == 0x10 || code == 0x12 || code == 0x60; // 无能力串时的兜底
-            return dev.Vcp.ContainsKey(code);
+            return dev.Vcp.ContainsKey(code) || ExtraPresentCodes.Contains(code);
         }
 
         // ------------------------------------------------------------- UI 行
-        private void AddHeader(string title)
+        private void AddHeader(string title, byte restoreCode, string restoreLabel)
         {
             int idx = _table.RowCount;
             _table.RowCount = idx + 1;
@@ -805,7 +888,207 @@ namespace MonitorOSD
             h.Font = _boldFont;
             h.Margin = new Padding(4, 16, 4, 4);
             _table.Controls.Add(h, 0, idx);
-            _table.SetColumnSpan(h, 3);
+            _table.SetColumnSpan(h, 2);
+            if (restoreCode != 0)
+            {
+                Button rb = new Button();
+                rb.Text = restoreLabel != null ? restoreLabel : "恢复本组";
+                rb.AutoSize = true;
+                rb.Margin = new Padding(4, 12, 4, 0);
+                byte rc = restoreCode;
+                rb.Click += delegate { ExecuteRestore(rc); };
+                _table.Controls.Add(rb, 2, idx);
+            }
+        }
+
+        // 分组一键恢复: 0x05=恢复亮度/对比度, 0x08=恢复颜色
+        private void ExecuteRestore(byte code)
+        {
+            MonitorDevice dev = _current;
+            SendSetCode(dev, code, 1);
+            ScheduleRefresh(1000);
+        }
+
+        // 总的一键恢复: 依次执行所有可编辑分组的恢复
+        private void RestoreAll()
+        {
+            if (_current == null) return;
+            DialogResult dr = MessageBox.Show(this,
+                "将依次执行:\n  · 恢复亮度/对比度出厂默认\n  · 恢复颜色默认 (RGB 增益/黑电平等)\n\n扬声器音量、输入源、画面模式、电源等不会被改动。\n\n确定继续吗?",
+                "一键恢复全部", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (dr != DialogResult.Yes) return;
+            MonitorDevice dev = _current;
+            int gen = _gen;
+            RunBackground(delegate
+            {
+                if (gen != _gen || _closing) return;
+                SafeUI(delegate { SetStatus("一键恢复 1/2: 亮度/对比度…", 0); });
+                SendSetCode(dev, 0x05, 1);
+                System.Threading.Thread.Sleep(700);
+                if (gen != _gen || _closing) return;
+                SafeUI(delegate { SetStatus("一键恢复 2/2: 颜色默认…", 0); });
+                SendSetCode(dev, 0x08, 1);
+                System.Threading.Thread.Sleep(400);
+                SafeUI(delegate { if (gen == _gen) RefreshValues(); });
+            });
+        }
+
+        private void SendSetCode(MonitorDevice dev, byte code, uint value)
+        {
+            if (dev == null || _closing) return;
+            bool ok = false;
+            int err = 0;
+            lock (_ddcLock)
+            {
+                try
+                {
+                    ok = NativeMethods.SetVCPFeature(dev.Handle, code, value);
+                    if (!ok) err = Marshal.GetLastWin32Error();
+                }
+                catch { }
+            }
+            string msg = ok
+                ? "已发送: " + VcpNames.Name(code) + " → " + VcpNames.Value(code, value)
+                : "设置失败 (Win32 错误码 " + err + "): " + VcpNames.Name(code);
+            int kind = ok ? 1 : 2;
+            SafeUI(delegate { SetStatus(msg, kind); });
+        }
+
+        private void ScheduleRefresh(int delayMs)
+        {
+            System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+            t.Interval = delayMs;
+            t.Tick += delegate
+            {
+                t.Stop();
+                t.Dispose();
+                RefreshValues();
+            };
+            t.Start();
+        }
+
+        // 系统侧 (显卡) 分辨率信息 + 打开显示设置的入口
+        private void AddSystemDisplayRows(MonitorDevice dev)
+        {
+            string text = "未知";
+            try
+            {
+                NativeMethods.DEVMODE dm = new NativeMethods.DEVMODE();
+                dm.dmSize = (short)Marshal.SizeOf(typeof(NativeMethods.DEVMODE));
+                if (NativeMethods.EnumDisplaySettings(dev.DeviceName, -1, ref dm) && dm.dmPelsWidth > 0)
+                    text = dm.dmPelsWidth + "×" + dm.dmPelsHeight + " @ " + dm.dmDisplayFrequency + " Hz";
+            }
+            catch { }
+
+            int idx = _table.RowCount;
+            _table.RowCount = idx + 1;
+            _table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            Label name = new Label();
+            name.Text = "系统分辨率 (显卡控制)";
+            name.AutoSize = true;
+            name.Margin = new Padding(8, 12, 4, 0);
+            Label val = new Label();
+            val.Text = text;
+            val.AutoSize = true;
+            val.ForeColor = Color.FromArgb(90, 90, 90);
+            val.Margin = new Padding(6, 12, 4, 0);
+            Button btn = new Button();
+            btn.Text = "打开 Windows 显示设置";
+            btn.AutoSize = true;
+            btn.Margin = new Padding(4, 6, 4, 0);
+            btn.Click += delegate
+            {
+                try { Process.Start("ms-settings:display"); } catch { }
+            };
+            _table.Controls.Add(name, 0, idx);
+            _table.Controls.Add(val, 1, idx);
+            _table.Controls.Add(btn, 2, idx);
+        }
+
+        // 全量扫描 0x00-0xFF, 找出能力串之外的隐藏响应码 (只读)
+        private void ScanHidden(Control btn)
+        {
+            MonitorDevice dev = _current;
+            if (dev == null) return;
+            int gen = _gen;
+            btn.Enabled = false;
+            btn.Text = "扫描中…";
+            SetStatus("正在全量扫描 VCP 0x00-0xFF (约 15-25 秒, 只读, 不修改任何值)…", 0);
+            RunBackground(delegate
+            {
+                List<int[]> found = new List<int[]>();
+                for (int c = 0; c <= 255; c++)
+                {
+                    if (gen != _gen || _closing) return;
+                    uint type = 0, cur = 0, max = 0;
+                    bool ok = false;
+                    lock (_ddcLock)
+                    {
+                        try { ok = NativeMethods.GetVCPFeatureAndVCPFeatureReply(dev.Handle, (byte)c, ref type, ref cur, ref max); }
+                        catch { }
+                    }
+                    if (ok) found.Add(new int[] { c, (int)type, (int)cur, (int)max });
+                    System.Threading.Thread.Sleep(6);
+                }
+                SafeUI(delegate
+                {
+                    if (gen != _gen || _closing) return;
+                    int hidden = AddHiddenSection(found);
+                    btn.Text = "已扫描";
+                    SetStatus("扫描完成: " + found.Count + " 个响应码, 其中 " + hidden + " 个此前未展示", 1);
+                });
+            });
+        }
+
+        private static bool IsInSections(byte c)
+        {
+            byte[][] sections = new byte[][] { SectionCommon, SectionImage, SectionReset, SectionInfo };
+            foreach (byte[] sec in sections)
+                if (Array.IndexOf(sec, c) >= 0) return true;
+            return c == 0x02;
+        }
+
+        private int AddHiddenSection(List<int[]> found)
+        {
+            List<int[]> extra = new List<int[]>();
+            foreach (int[] f in found)
+                if (!IsInSections((byte)f[0])) extra.Add(f);
+            if (extra.Count == 0) return 0;
+            AddHeader("厂商隐藏参数 (只读)", 0, null);
+            foreach (int[] f in extra)
+                AddHiddenRow((byte)f[0], (uint)f[2], (uint)f[3], (uint)f[1]);
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine();
+            sb.AppendLine("== 全量扫描响应码 (0x00-0xFF, 共 " + found.Count + " 个) ==");
+            foreach (int[] f in found) sb.Append(f[0].ToString("X2") + " ");
+            sb.AppendLine();
+            _capsBox.AppendText(sb.ToString());
+            return extra.Count;
+        }
+
+        private void AddHiddenRow(byte code, uint cur, uint max, uint type)
+        {
+            int idx = _table.RowCount;
+            _table.RowCount = idx + 1;
+            _table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            Label name = new Label();
+            name.Text = VcpNames.Name(code) + " 0x" + code.ToString("X2");
+            name.AutoSize = true;
+            name.Margin = new Padding(8, 10, 4, 0);
+            Label val = new Label();
+            val.Text = "当前=" + cur + ", 最大=" + max + ", 类型=" + type;
+            val.AutoSize = true;
+            val.ForeColor = Color.FromArgb(90, 90, 90);
+            val.Margin = new Padding(6, 10, 4, 0);
+            _table.Controls.Add(name, 0, idx);
+            _table.Controls.Add(val, 1, idx);
+            _table.SetColumnSpan(val, 2);
+            VcpRow row = new VcpRow();
+            row.Code = code;
+            row.Name = name.Text;
+            row.Kind = VcpRow.KindInfo;
+            row.ValueLabel = val;
+            _rows.Add(row);
         }
 
         private void AddRow(VcpRow row)
@@ -984,12 +1267,7 @@ namespace MonitorOSD
                     if (gen != _gen || _closing) return;
                     if (row.Kind == VcpRow.KindButton) continue;
                     uint type = 0, cur = 0, max = 0;
-                    bool ok = false;
-                    lock (_ddcLock)
-                    {
-                        try { ok = NativeMethods.GetVCPFeatureAndVCPFeatureReply(dev.Handle, row.Code, ref type, ref cur, ref max); }
-                        catch { }
-                    }
+                    bool ok = ReadVcp(dev, row.Code, out type, out cur, out max);
                     uint current = ok ? cur : uint.MaxValue;
                     SafeUI(delegate
                     {
