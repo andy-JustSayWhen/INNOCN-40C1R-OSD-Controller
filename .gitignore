@@ -1,0 +1,8 @@
+# 构建产物
+*.exe
+*.pdb
+
+# 截图与临时文件
+*.png
+tools/shot*.ps1
+Thumbs.db
