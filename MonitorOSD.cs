@@ -79,11 +79,10 @@ namespace MonitorOSD
             public short dmSize;
             public short dmDriverExtra;
             public int dmFields;
-            public int dmOrientation;
-            public int dmPaperSize;
-            public int dmPaperLength;
-            public int dmPaperWidth;
-            public int dmScale;
+            public int dmPositionX;
+            public int dmPositionY;
+            public int dmDisplayOrientation;
+            public int dmDisplayFixedOutput;
             public short dmColor;
             public short dmDuplex;
             public short dmYResolution;
@@ -457,12 +456,14 @@ namespace MonitorOSD
         }
     }
 
-    // ---------------------------------------------- 三角洲 1080P 显示模式
+    // -------------------------------------------------- 一键开关 1080P
     internal static class DeltaDisplayMode
     {
-        private const int TargetWidth = 1920;
-        private const int TargetHeight = 1080;
-        private const int TargetRefreshRate = 144;
+        private const int GameWidth = 1920;
+        private const int GameHeight = 1080;
+        private const int DesktopWidth = 3440;
+        private const int DesktopHeight = 1440;
+        private const int RefreshRate = 144;
         private const int GetDpiScale = -3;
         private const int SetDpiScale = -4;
 
@@ -479,8 +480,10 @@ namespace MonitorOSD
                 text.IndexOf("40C1R", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        public static bool Apply(MonitorDevice dev, Action<string> progress, out string error)
+        public static bool Toggle(MonitorDevice dev, Action<string> progress,
+            out bool switchedTo1080, out string error)
         {
+            switchedTo1080 = false;
             error = null;
             if (!Is40C1R(dev))
             {
@@ -488,16 +491,32 @@ namespace MonitorOSD
                 return false;
             }
 
-            if (progress != null) progress("正在切换 40C1R 至 1920×1080 @ 144Hz…");
-            if (!SetResolutionAndRefreshRate(dev.DeviceName, out error)) return false;
+            NativeMethods.DEVMODE current = NewDevMode();
+            if (!NativeMethods.EnumDisplaySettings(
+                dev.DeviceName, NativeMethods.ENUM_CURRENT_SETTINGS, ref current))
+            {
+                error = "无法读取 40C1R 当前显示模式。";
+                return false;
+            }
 
-            if (progress != null) progress("分辨率与刷新率已确认，正在设置缩放 100%…");
-            if (!SetScaleTo100Percent(dev.DeviceName, out error)) return false;
+            switchedTo1080 = current.dmPelsWidth != GameWidth || current.dmPelsHeight != GameHeight;
+            int width = switchedTo1080 ? GameWidth : DesktopWidth;
+            int height = switchedTo1080 ? GameHeight : DesktopHeight;
+            int scale = switchedTo1080 ? 100 : 125;
+
+            if (progress != null) progress("正在切换 40C1R 至 " + width + "×" + height +
+                " @ " + RefreshRate + "Hz…");
+            if (!SetResolutionAndRefreshRate(dev.DeviceName, width, height, RefreshRate, out error))
+                return false;
+
+            if (progress != null) progress("分辨率与刷新率已确认，正在设置缩放 " + scale + "%…");
+            if (!SetScalePercent(dev.DeviceName, scale, out error)) return false;
 
             return true;
         }
 
-        private static bool SetResolutionAndRefreshRate(string deviceName, out string error)
+        private static bool SetResolutionAndRefreshRate(
+            string deviceName, int width, int height, int refreshRate, out string error)
         {
             error = null;
             if (string.IsNullOrEmpty(deviceName))
@@ -512,8 +531,8 @@ namespace MonitorOSD
             {
                 NativeMethods.DEVMODE mode = NewDevMode();
                 if (!NativeMethods.EnumDisplaySettings(deviceName, i, ref mode)) break;
-                if (mode.dmPelsWidth == TargetWidth && mode.dmPelsHeight == TargetHeight &&
-                    mode.dmDisplayFrequency == TargetRefreshRate)
+                if (mode.dmPelsWidth == width && mode.dmPelsHeight == height &&
+                    mode.dmDisplayFrequency == refreshRate)
                 {
                     supported = mode;
                     modeFound = true;
@@ -522,7 +541,8 @@ namespace MonitorOSD
             }
             if (!modeFound)
             {
-                error = "40C1R 的显卡驱动未提供 1920×1080 @ 144Hz 模式。";
+                error = "40C1R 的显卡驱动未提供 " + width + "×" + height + " @ " +
+                    refreshRate + "Hz 模式。";
                 return false;
             }
 
@@ -533,9 +553,9 @@ namespace MonitorOSD
                 error = "无法读取 40C1R 当前显示模式。";
                 return false;
             }
-            target.dmPelsWidth = TargetWidth;
-            target.dmPelsHeight = TargetHeight;
-            target.dmDisplayFrequency = TargetRefreshRate;
+            target.dmPelsWidth = width;
+            target.dmPelsHeight = height;
+            target.dmDisplayFrequency = refreshRate;
             if (supported.dmBitsPerPel > 0) target.dmBitsPerPel = supported.dmBitsPerPel;
             target.dmFields |= NativeMethods.DM_PELSWIDTH | NativeMethods.DM_PELSHEIGHT |
                 NativeMethods.DM_DISPLAYFREQUENCY | NativeMethods.DM_BITSPERPEL;
@@ -560,10 +580,10 @@ namespace MonitorOSD
             NativeMethods.DEVMODE current = NewDevMode();
             if (!NativeMethods.EnumDisplaySettings(
                 deviceName, NativeMethods.ENUM_CURRENT_SETTINGS, ref current) ||
-                current.dmPelsWidth != TargetWidth || current.dmPelsHeight != TargetHeight ||
-                current.dmDisplayFrequency != TargetRefreshRate)
+                current.dmPelsWidth != width || current.dmPelsHeight != height ||
+                current.dmDisplayFrequency != refreshRate)
             {
-                error = "显示模式写入后复核不符，WeGame 未启动。";
+                error = "显示模式写入后复核不符，未执行 WeGame 操作。";
                 return false;
             }
             return true;
@@ -576,7 +596,7 @@ namespace MonitorOSD
             return mode;
         }
 
-        private static bool SetScaleTo100Percent(string deviceName, out string error)
+        private static bool SetScalePercent(string deviceName, int scalePercent, out string error)
         {
             error = null;
             NativeMethods.D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openData =
@@ -604,7 +624,16 @@ namespace MonitorOSD
                     return false;
                 }
 
-                if (dpi.CurrentScaleRelative != dpi.MinScaleRelative)
+                int targetIndex = scalePercent == 100 ? 0 : (scalePercent == 125 ? 1 : -1);
+                int targetRelative = dpi.MinScaleRelative + targetIndex;
+                if (targetIndex < 0 || targetRelative < dpi.MinScaleRelative ||
+                    targetRelative > dpi.MaxScaleRelative)
+                {
+                    error = "系统不支持 " + scalePercent + "% 缩放。";
+                    return false;
+                }
+
+                if (dpi.CurrentScaleRelative != targetRelative)
                 {
                     NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_SET setPacket =
                         new NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_SET();
@@ -613,7 +642,7 @@ namespace MonitorOSD
                         typeof(NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_SET));
                     setPacket.Header.AdapterId = openData.AdapterLuid;
                     setPacket.Header.Id = openData.SourceId;
-                    setPacket.ScaleRelative = dpi.MinScaleRelative;
+                    setPacket.ScaleRelative = targetRelative;
                     result = NativeMethods.DisplayConfigSetDeviceInfo(ref setPacket);
                     if (result != 0)
                     {
@@ -625,9 +654,9 @@ namespace MonitorOSD
 
                 NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET verify = NewDpiGetPacket(openData);
                 result = NativeMethods.DisplayConfigGetDeviceInfo(ref verify);
-                if (result != 0 || verify.CurrentScaleRelative != verify.MinScaleRelative)
+                if (result != 0 || verify.CurrentScaleRelative != targetRelative)
                 {
-                    error = "系统缩放写入后复核不符，WeGame 未启动。";
+                    error = "系统缩放写入后复核不符，未执行 WeGame 操作。";
                     return false;
                 }
                 return true;
@@ -724,6 +753,102 @@ namespace MonitorOSD
                 return File.Exists(path) ? path : null;
             }
             catch { return null; }
+        }
+
+        public static int CloseRunningWindows(string executablePath)
+        {
+            string root;
+            try { root = Path.GetDirectoryName(executablePath); }
+            catch { return 0; }
+            if (string.IsNullOrEmpty(root)) return 0;
+            root = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+            int requested = 0;
+            foreach (Process process in Process.GetProcesses())
+            {
+                try
+                {
+                    if (process.MainWindowHandle == IntPtr.Zero) continue;
+                    string processPath = process.MainModule.FileName;
+                    if (!processPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (process.CloseMainWindow()) requested++;
+                }
+                catch { }
+                finally { process.Dispose(); }
+            }
+            return requested;
+        }
+    }
+
+    // ----------------------------------------------- 五秒关闭确认窗
+    internal sealed class TimedWeGameCloseDialog : Form
+    {
+        private int _secondsLeft = 5;
+        private readonly Label _message;
+        private readonly System.Windows.Forms.Timer _timer;
+
+        private TimedWeGameCloseDialog()
+        {
+            Text = "切换完成";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(390, 135);
+            try { Font = new Font("Microsoft YaHei UI", 9F); } catch { }
+
+            _message = new Label();
+            _message.AutoSize = false;
+            _message.Location = new Point(18, 18);
+            _message.Size = new Size(354, 55);
+            _message.TextAlign = ContentAlignment.MiddleLeft;
+
+            Button yes = new Button();
+            yes.Text = "是，关闭 WeGame";
+            yes.DialogResult = DialogResult.Yes;
+            yes.Size = new Size(125, 30);
+            yes.Location = new Point(105, 88);
+
+            Button no = new Button();
+            no.Text = "否，保持运行";
+            no.DialogResult = DialogResult.No;
+            no.Size = new Size(125, 30);
+            no.Location = new Point(240, 88);
+
+            AcceptButton = yes;
+            CancelButton = no;
+            Controls.Add(_message);
+            Controls.Add(yes);
+            Controls.Add(no);
+
+            _timer = new System.Windows.Forms.Timer();
+            _timer.Interval = 1000;
+            _timer.Tick += delegate
+            {
+                _secondsLeft--;
+                UpdateMessage();
+                if (_secondsLeft <= 0)
+                {
+                    _timer.Stop();
+                    DialogResult = DialogResult.No;
+                    Close();
+                }
+            };
+            Shown += delegate { UpdateMessage(); _timer.Start(); };
+            FormClosed += delegate { _timer.Stop(); _timer.Dispose(); };
+        }
+
+        private void UpdateMessage()
+        {
+            _message.Text = "已切回 3440×1440、125%、144Hz。\n是否关闭 WeGame？" +
+                "（" + Math.Max(0, _secondsLeft) + " 秒后默认不关闭）";
+        }
+
+        public static DialogResult Ask(IWin32Window owner)
+        {
+            using (TimedWeGameCloseDialog dialog = new TimedWeGameCloseDialog())
+                return dialog.ShowDialog(owner);
         }
     }
 
@@ -979,7 +1104,7 @@ namespace MonitorOSD
             btnRestoreAll.Margin = new Padding(6, 4, 3, 0);
             btnRestoreAll.Click += delegate { RestoreAll(); };
             _btnDeltaMode = new Button();
-            _btnDeltaMode.Text = "三角洲 1080P 模式";
+            _btnDeltaMode.Text = "一键开关1080P";
             _btnDeltaMode.AutoSize = true;
             _btnDeltaMode.Enabled = false;
             _btnDeltaMode.Margin = new Padding(3, 4, 3, 0);
@@ -989,13 +1114,13 @@ namespace MonitorOSD
                 if (_suppress) return;
                 SelectMonitor(_cboMonitor.SelectedIndex);
             };
+            top.Controls.Add(_btnDeltaMode);
+            top.SetFlowBreak(_btnDeltaMode, true);
             top.Controls.Add(lbl);
             top.Controls.Add(_cboMonitor);
             top.Controls.Add(btnReload);
             top.Controls.Add(btnRefresh);
             top.Controls.Add(btnRestoreAll);
-            top.SetFlowBreak(btnRestoreAll, true);
-            top.Controls.Add(_btnDeltaMode);
 
             // 控件列表 (滚动区 + 表格)
             _table = new TableLayoutPanel();
@@ -1165,20 +1290,21 @@ namespace MonitorOSD
             }
 
             _btnDeltaMode.Enabled = false;
-            SetStatus("准备切换三角洲 1080P 模式…", 0);
+            SetStatus("准备切换 40C1R 显示模式…", 0);
             RunBackground(delegate
             {
                 string error;
-                bool ok = DeltaDisplayMode.Apply(dev, delegate(string message)
+                bool switchedTo1080;
+                bool ok = DeltaDisplayMode.Toggle(dev, delegate(string message)
                 {
                     SafeUI(delegate { SetStatus(message, 0); });
-                }, out error);
+                }, out switchedTo1080, out error);
                 if (!ok)
                 {
                     SafeUI(delegate
                     {
                         UpdateDeltaModeButton();
-                        SetStatus(error ?? "三角洲显示模式切换失败。", 2);
+                        SetStatus(error ?? "显示模式切换失败。", 2);
                     });
                     return;
                 }
@@ -1194,28 +1320,57 @@ namespace MonitorOSD
                     return;
                 }
 
-                try
+                if (switchedTo1080)
                 {
-                    ProcessStartInfo startInfo = new ProcessStartInfo();
-                    startInfo.FileName = weGamePath;
-                    startInfo.WorkingDirectory = Path.GetDirectoryName(weGamePath);
-                    startInfo.UseShellExecute = true;
-                    Process.Start(startInfo);
-                }
-                catch (Exception ex)
-                {
+                    try
+                    {
+                        ProcessStartInfo startInfo = new ProcessStartInfo();
+                        startInfo.FileName = weGamePath;
+                        startInfo.WorkingDirectory = Path.GetDirectoryName(weGamePath);
+                        startInfo.UseShellExecute = true;
+                        Process.Start(startInfo);
+                    }
+                    catch (Exception ex)
+                    {
+                        SafeUI(delegate
+                        {
+                            UpdateDeltaModeButton();
+                            SetStatus("显示模式已切换，但打开 WeGame 失败: " + ex.Message, 2);
+                        });
+                        return;
+                    }
+
                     SafeUI(delegate
                     {
                         UpdateDeltaModeButton();
-                        SetStatus("显示模式已切换，但打开 WeGame 失败: " + ex.Message, 2);
+                        SetStatus("已切换至 1920×1080、100%、144Hz，并已打开 WeGame。", 1);
                     });
                     return;
                 }
 
                 SafeUI(delegate
                 {
-                    UpdateDeltaModeButton();
-                    SetStatus("已切换至 1920×1080、100%、144Hz，并已打开 WeGame；请在 WeGame 中启动三角洲。", 1);
+                    DialogResult answer = TimedWeGameCloseDialog.Ask(this);
+                    if (answer != DialogResult.Yes)
+                    {
+                        UpdateDeltaModeButton();
+                        SetStatus("已切换至 3440×1440、125%、144Hz；WeGame 保持运行。", 1);
+                        return;
+                    }
+
+                    SetStatus("正在关闭 WeGame…", 0);
+                    RunBackground(delegate
+                    {
+                        int requested = WeGameLocator.CloseRunningWindows(weGamePath);
+                        SafeUI(delegate
+                        {
+                            UpdateDeltaModeButton();
+                            SetStatus(requested > 0
+                                ? "已切换至 3440×1440、125%、144Hz，并已请求关闭 WeGame。"
+                                : "已切换至 3440×1440、125%、144Hz；未发现可关闭的 WeGame 窗口。",
+                                requested > 0 ? 1 : 2);
+                        });
+                    });
                 });
             });
         }
