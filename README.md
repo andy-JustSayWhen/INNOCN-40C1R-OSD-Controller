@@ -74,6 +74,11 @@ powershell -ExecutionPolicy Bypass -File tools\get-monitor.ps1
 
 ## 界面说明
 
+专项模式的功能表现与实现约束分别见：
+
+- [三角洲 1080P 模式功能规范](docs/SPEC-三角洲1080P模式.md)
+- [三角洲 1080P 模式技术设计](docs/design-三角洲1080P模式.md)
+
 | 位置 | 内容 |
 | --- | --- |
 | 顶部 | 显示器切换、重新枚举、重读数值、**一键恢复全部** |
