@@ -13,9 +13,11 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace MonitorOSD
 {
@@ -34,6 +36,15 @@ namespace MonitorOSD
     // ------------------------------------------------------------------ Win32
     internal static class NativeMethods
     {
+        public const int ENUM_CURRENT_SETTINGS = -1;
+        public const int DISP_CHANGE_SUCCESSFUL = 0;
+        public const uint CDS_UPDATEREGISTRY = 0x00000001;
+        public const uint CDS_TEST = 0x00000002;
+        public const int DM_BITSPERPEL = 0x00040000;
+        public const int DM_PELSWIDTH = 0x00080000;
+        public const int DM_PELSHEIGHT = 0x00100000;
+        public const int DM_DISPLAYFREQUENCY = 0x00400000;
+
         public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data);
 
         [StructLayout(LayoutKind.Sequential)]
@@ -94,8 +105,75 @@ namespace MonitorOSD
             public int dmPanningHeight;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LUID
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME
+        {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string DeviceName;
+            public uint AdapterHandle;
+            public LUID AdapterLuid;
+            public uint SourceId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct D3DKMT_CLOSEADAPTER
+        {
+            public uint AdapterHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DISPLAYCONFIG_DEVICE_INFO_HEADER
+        {
+            public int Type;
+            public uint Size;
+            public LUID AdapterId;
+            public uint Id;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DISPLAYCONFIG_SOURCE_DPI_SCALE_GET
+        {
+            public DISPLAYCONFIG_DEVICE_INFO_HEADER Header;
+            public int MinScaleRelative;
+            public int CurrentScaleRelative;
+            public int MaxScaleRelative;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DISPLAYCONFIG_SOURCE_DPI_SCALE_SET
+        {
+            public DISPLAYCONFIG_DEVICE_INFO_HEADER Header;
+            public int ScaleRelative;
+        }
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int ChangeDisplaySettingsEx(
+            string deviceName, ref DEVMODE devMode, IntPtr hwnd, uint flags, IntPtr parameters);
+
+        [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
+        public static extern int D3DKMTOpenAdapterFromGdiDisplayName(
+            ref D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openData);
+
+        [DllImport("gdi32.dll")]
+        public static extern int D3DKMTCloseAdapter(ref D3DKMT_CLOSEADAPTER closeData);
+
+        [DllImport("user32.dll")]
+        public static extern int DisplayConfigGetDeviceInfo(
+            ref DISPLAYCONFIG_SOURCE_DPI_SCALE_GET requestPacket);
+
+        [DllImport("user32.dll")]
+        public static extern int DisplayConfigSetDeviceInfo(
+            ref DISPLAYCONFIG_SOURCE_DPI_SCALE_SET setPacket);
 
         [DllImport("user32.dll")]
         public static extern bool SetProcessDPIAware();
@@ -311,6 +389,275 @@ namespace MonitorOSD
         }
     }
 
+    // ---------------------------------------------- 三角洲 1080P 显示模式
+    internal static class DeltaDisplayMode
+    {
+        private const int TargetWidth = 1920;
+        private const int TargetHeight = 1080;
+        private const int TargetRefreshRate = 144;
+        private const int GetDpiScale = -3;
+        private const int SetDpiScale = -4;
+
+        public static bool Is40C1R(MonitorDevice dev)
+        {
+            if (dev == null) return false;
+            return ContainsModel(dev.Description) || ContainsModel(dev.CapsRaw);
+        }
+
+        private static bool ContainsModel(string text)
+        {
+            return !string.IsNullOrEmpty(text) &&
+                text.IndexOf("40C1R", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        public static bool Apply(MonitorDevice dev, Action<string> progress, out string error)
+        {
+            error = null;
+            if (!Is40C1R(dev))
+            {
+                error = "未找到 40C1R 显示器。";
+                return false;
+            }
+
+            if (progress != null) progress("正在切换 40C1R 至 1920×1080 @ 144Hz…");
+            if (!SetResolutionAndRefreshRate(dev.DeviceName, out error)) return false;
+
+            if (progress != null) progress("分辨率与刷新率已确认，正在设置缩放 100%…");
+            if (!SetScaleTo100Percent(dev.DeviceName, out error)) return false;
+
+            return true;
+        }
+
+        private static bool SetResolutionAndRefreshRate(string deviceName, out string error)
+        {
+            error = null;
+            if (string.IsNullOrEmpty(deviceName))
+            {
+                error = "40C1R 缺少系统显示设备名。";
+                return false;
+            }
+
+            NativeMethods.DEVMODE supported = new NativeMethods.DEVMODE();
+            bool modeFound = false;
+            for (int i = 0; ; i++)
+            {
+                NativeMethods.DEVMODE mode = NewDevMode();
+                if (!NativeMethods.EnumDisplaySettings(deviceName, i, ref mode)) break;
+                if (mode.dmPelsWidth == TargetWidth && mode.dmPelsHeight == TargetHeight &&
+                    mode.dmDisplayFrequency == TargetRefreshRate)
+                {
+                    supported = mode;
+                    modeFound = true;
+                    break;
+                }
+            }
+            if (!modeFound)
+            {
+                error = "40C1R 的显卡驱动未提供 1920×1080 @ 144Hz 模式。";
+                return false;
+            }
+
+            NativeMethods.DEVMODE target = NewDevMode();
+            if (!NativeMethods.EnumDisplaySettings(
+                deviceName, NativeMethods.ENUM_CURRENT_SETTINGS, ref target))
+            {
+                error = "无法读取 40C1R 当前显示模式。";
+                return false;
+            }
+            target.dmPelsWidth = TargetWidth;
+            target.dmPelsHeight = TargetHeight;
+            target.dmDisplayFrequency = TargetRefreshRate;
+            if (supported.dmBitsPerPel > 0) target.dmBitsPerPel = supported.dmBitsPerPel;
+            target.dmFields |= NativeMethods.DM_PELSWIDTH | NativeMethods.DM_PELSHEIGHT |
+                NativeMethods.DM_DISPLAYFREQUENCY | NativeMethods.DM_BITSPERPEL;
+
+            int result = NativeMethods.ChangeDisplaySettingsEx(
+                deviceName, ref target, IntPtr.Zero, NativeMethods.CDS_TEST, IntPtr.Zero);
+            if (result != NativeMethods.DISP_CHANGE_SUCCESSFUL)
+            {
+                error = "显卡驱动拒绝测试目标显示模式，返回码 " + result + "。";
+                return false;
+            }
+
+            result = NativeMethods.ChangeDisplaySettingsEx(
+                deviceName, ref target, IntPtr.Zero, NativeMethods.CDS_UPDATEREGISTRY, IntPtr.Zero);
+            if (result != NativeMethods.DISP_CHANGE_SUCCESSFUL)
+            {
+                error = "切换分辨率或刷新率失败，返回码 " + result + "。";
+                return false;
+            }
+
+            System.Threading.Thread.Sleep(1200);
+            NativeMethods.DEVMODE current = NewDevMode();
+            if (!NativeMethods.EnumDisplaySettings(
+                deviceName, NativeMethods.ENUM_CURRENT_SETTINGS, ref current) ||
+                current.dmPelsWidth != TargetWidth || current.dmPelsHeight != TargetHeight ||
+                current.dmDisplayFrequency != TargetRefreshRate)
+            {
+                error = "显示模式写入后复核不符，WeGame 未启动。";
+                return false;
+            }
+            return true;
+        }
+
+        private static NativeMethods.DEVMODE NewDevMode()
+        {
+            NativeMethods.DEVMODE mode = new NativeMethods.DEVMODE();
+            mode.dmSize = (short)Marshal.SizeOf(typeof(NativeMethods.DEVMODE));
+            return mode;
+        }
+
+        private static bool SetScaleTo100Percent(string deviceName, out string error)
+        {
+            error = null;
+            NativeMethods.D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openData =
+                new NativeMethods.D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME();
+            openData.DeviceName = deviceName;
+            int openResult = NativeMethods.D3DKMTOpenAdapterFromGdiDisplayName(ref openData);
+            if (openResult != 0)
+            {
+                error = "无法定位 40C1R 对应的显卡显示源，返回码 " + openResult + "。";
+                return false;
+            }
+
+            try
+            {
+                NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET dpi = NewDpiGetPacket(openData);
+                int result = NativeMethods.DisplayConfigGetDeviceInfo(ref dpi);
+                if (result != 0)
+                {
+                    error = "无法读取 40C1R 的系统缩放，返回码 " + result + "。";
+                    return false;
+                }
+                if (dpi.MinScaleRelative > 0 || dpi.MinScaleRelative > dpi.MaxScaleRelative)
+                {
+                    error = "系统返回了无效的缩放范围。";
+                    return false;
+                }
+
+                if (dpi.CurrentScaleRelative != dpi.MinScaleRelative)
+                {
+                    NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_SET setPacket =
+                        new NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_SET();
+                    setPacket.Header.Type = SetDpiScale;
+                    setPacket.Header.Size = (uint)Marshal.SizeOf(
+                        typeof(NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_SET));
+                    setPacket.Header.AdapterId = openData.AdapterLuid;
+                    setPacket.Header.Id = openData.SourceId;
+                    setPacket.ScaleRelative = dpi.MinScaleRelative;
+                    result = NativeMethods.DisplayConfigSetDeviceInfo(ref setPacket);
+                    if (result != 0)
+                    {
+                        error = "设置 40C1R 的系统缩放失败，返回码 " + result + "。";
+                        return false;
+                    }
+                    System.Threading.Thread.Sleep(500);
+                }
+
+                NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET verify = NewDpiGetPacket(openData);
+                result = NativeMethods.DisplayConfigGetDeviceInfo(ref verify);
+                if (result != 0 || verify.CurrentScaleRelative != verify.MinScaleRelative)
+                {
+                    error = "系统缩放写入后复核不符，WeGame 未启动。";
+                    return false;
+                }
+                return true;
+            }
+            finally
+            {
+                NativeMethods.D3DKMT_CLOSEADAPTER closeData = new NativeMethods.D3DKMT_CLOSEADAPTER();
+                closeData.AdapterHandle = openData.AdapterHandle;
+                try { NativeMethods.D3DKMTCloseAdapter(ref closeData); } catch { }
+            }
+        }
+
+        private static NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET NewDpiGetPacket(
+            NativeMethods.D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openData)
+        {
+            NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET packet =
+                new NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET();
+            packet.Header.Type = GetDpiScale;
+            packet.Header.Size = (uint)Marshal.SizeOf(
+                typeof(NativeMethods.DISPLAYCONFIG_SOURCE_DPI_SCALE_GET));
+            packet.Header.AdapterId = openData.AdapterLuid;
+            packet.Header.Id = openData.SourceId;
+            return packet;
+        }
+    }
+
+    // --------------------------------------------------------- WeGame 定位
+    internal static class WeGameLocator
+    {
+        public static string FindExecutable(out string error)
+        {
+            error = null;
+            RegistryHive[] hives = new RegistryHive[] {
+                RegistryHive.CurrentUser, RegistryHive.LocalMachine
+            };
+            RegistryView[] views = new RegistryView[] {
+                RegistryView.Registry32, RegistryView.Registry64
+            };
+
+            foreach (RegistryHive hive in hives)
+            {
+                foreach (RegistryView view in views)
+                {
+                    try
+                    {
+                        using (RegistryKey baseKey = RegistryKey.OpenBaseKey(hive, view))
+                        using (RegistryKey uninstall = baseKey.OpenSubKey(
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"))
+                        {
+                            if (uninstall == null) continue;
+                            foreach (string subName in uninstall.GetSubKeyNames())
+                            {
+                                using (RegistryKey app = uninstall.OpenSubKey(subName))
+                                {
+                                    if (app == null) continue;
+                                    string displayName = Convert.ToString(app.GetValue("DisplayName"));
+                                    if (!string.Equals(displayName, "WeGame",
+                                        StringComparison.OrdinalIgnoreCase)) continue;
+
+                                    string found = AcceptCandidate(
+                                        Convert.ToString(app.GetValue("DisplayIcon")));
+                                    if (found != null) return found;
+
+                                    string installLocation = Convert.ToString(
+                                        app.GetValue("InstallLocation"));
+                                    if (!string.IsNullOrWhiteSpace(installLocation))
+                                    {
+                                        found = AcceptCandidate(Path.Combine(
+                                            installLocation.Trim().Trim('"'), "wegame.exe"));
+                                        if (found != null) return found;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            error = "未从本机安装信息中找到 WeGame 主程序。";
+            return null;
+        }
+
+        private static string AcceptCandidate(string candidate)
+        {
+            if (string.IsNullOrWhiteSpace(candidate)) return null;
+            string path = candidate.Trim().Trim('"');
+            int exeEnd = path.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+            if (exeEnd >= 0) path = path.Substring(0, exeEnd + 4).Trim().Trim('"');
+            try
+            {
+                if (!string.Equals(Path.GetFileName(path), "wegame.exe",
+                    StringComparison.OrdinalIgnoreCase)) return null;
+                return File.Exists(path) ? path : null;
+            }
+            catch { return null; }
+        }
+    }
+
     // ------------------------------------------------------------------ 名称表
     internal class UIntName
     {
@@ -522,6 +869,7 @@ namespace MonitorOSD
         private Panel _scroller;
         private Label _status;
         private TextBox _capsBox;
+        private Button _btnDeltaMode;
 
         public MainForm()
         {
@@ -535,9 +883,9 @@ namespace MonitorOSD
             // 顶部工具条
             FlowLayoutPanel top = new FlowLayoutPanel();
             top.Dock = DockStyle.Top;
-            top.Height = 42;
+            top.Height = 78;
             top.Padding = new Padding(10, 8, 10, 0);
-            top.WrapContents = false;
+            top.WrapContents = true;
             Label lbl = new Label();
             lbl.Text = "显示器:";
             lbl.AutoSize = true;
@@ -561,6 +909,12 @@ namespace MonitorOSD
             btnRestoreAll.AutoSize = true;
             btnRestoreAll.Margin = new Padding(6, 4, 3, 0);
             btnRestoreAll.Click += delegate { RestoreAll(); };
+            _btnDeltaMode = new Button();
+            _btnDeltaMode.Text = "三角洲 1080P 模式";
+            _btnDeltaMode.AutoSize = true;
+            _btnDeltaMode.Enabled = false;
+            _btnDeltaMode.Margin = new Padding(3, 4, 3, 0);
+            _btnDeltaMode.Click += delegate { RunDeltaMode(); };
             _cboMonitor.SelectedIndexChanged += delegate
             {
                 if (_suppress) return;
@@ -571,6 +925,8 @@ namespace MonitorOSD
             top.Controls.Add(btnReload);
             top.Controls.Add(btnRefresh);
             top.Controls.Add(btnRestoreAll);
+            top.SetFlowBreak(btnRestoreAll, true);
+            top.Controls.Add(_btnDeltaMode);
 
             // 控件列表 (滚动区 + 表格)
             _table = new TableLayoutPanel();
@@ -675,6 +1031,7 @@ namespace MonitorOSD
             List<MonitorDevice> old = _monitors;
             _monitors = new List<MonitorDevice>();
             _current = null;
+            _btnDeltaMode.Enabled = false;
             _capsBox.Text = "";
             _cboMonitor.Items.Clear();
 
@@ -695,6 +1052,7 @@ namespace MonitorOSD
                     if (gen != _gen || _closing) return;
                     _monitors = list ?? new List<MonitorDevice>();
                     foreach (MonitorDevice m in _monitors) _cboMonitor.Items.Add(m.Title);
+                    UpdateDeltaModeButton();
                     if (_monitors.Count == 0)
                     {
                         SetStatus("未发现可控制的物理显示器。" + (err ?? ""), 2);
@@ -714,6 +1072,83 @@ namespace MonitorOSD
             _current = _monitors[idx];
             ClearRows();
             BuildRowsAsync(_current);
+        }
+
+        private MonitorDevice Find40C1R()
+        {
+            foreach (MonitorDevice dev in _monitors)
+                if (DeltaDisplayMode.Is40C1R(dev)) return dev;
+            return null;
+        }
+
+        private void UpdateDeltaModeButton()
+        {
+            _btnDeltaMode.Enabled = Find40C1R() != null;
+        }
+
+        private void RunDeltaMode()
+        {
+            MonitorDevice dev = Find40C1R();
+            if (dev == null)
+            {
+                SetStatus("未找到 40C1R，三角洲模式不可用。", 2);
+                return;
+            }
+
+            _btnDeltaMode.Enabled = false;
+            SetStatus("准备切换三角洲 1080P 模式…", 0);
+            RunBackground(delegate
+            {
+                string error;
+                bool ok = DeltaDisplayMode.Apply(dev, delegate(string message)
+                {
+                    SafeUI(delegate { SetStatus(message, 0); });
+                }, out error);
+                if (!ok)
+                {
+                    SafeUI(delegate
+                    {
+                        UpdateDeltaModeButton();
+                        SetStatus(error ?? "三角洲显示模式切换失败。", 2);
+                    });
+                    return;
+                }
+
+                string weGamePath = WeGameLocator.FindExecutable(out error);
+                if (weGamePath == null)
+                {
+                    SafeUI(delegate
+                    {
+                        UpdateDeltaModeButton();
+                        SetStatus(error ?? "未找到 WeGame 主程序。", 2);
+                    });
+                    return;
+                }
+
+                try
+                {
+                    ProcessStartInfo startInfo = new ProcessStartInfo();
+                    startInfo.FileName = weGamePath;
+                    startInfo.WorkingDirectory = Path.GetDirectoryName(weGamePath);
+                    startInfo.UseShellExecute = true;
+                    Process.Start(startInfo);
+                }
+                catch (Exception ex)
+                {
+                    SafeUI(delegate
+                    {
+                        UpdateDeltaModeButton();
+                        SetStatus("显示模式已切换，但打开 WeGame 失败: " + ex.Message, 2);
+                    });
+                    return;
+                }
+
+                SafeUI(delegate
+                {
+                    UpdateDeltaModeButton();
+                    SetStatus("已切换至 1920×1080、100%、144Hz，并已打开 WeGame；请在 WeGame 中启动三角洲。", 1);
+                });
+            });
         }
 
         private void ClearRows()
