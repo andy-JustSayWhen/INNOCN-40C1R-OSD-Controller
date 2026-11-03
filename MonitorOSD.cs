@@ -686,6 +686,14 @@ namespace MonitorOSD
     // --------------------------------------------------------- WeGame 定位
     internal static class WeGameLocator
     {
+        private sealed class ProcessInfo
+        {
+            public int Id;
+            public int ParentId;
+            public string Name;
+            public string Path;
+        }
+
         public static string FindExecutable(out string error)
         {
             error = null;
@@ -755,28 +763,152 @@ namespace MonitorOSD
             catch { return null; }
         }
 
-        public static int CloseRunningWindows(string executablePath)
+        public static bool CloseRunningClient(
+            string executablePath, out int closedCount, out string error)
         {
+            closedCount = 0;
+            error = null;
             string root;
-            try { root = Path.GetDirectoryName(executablePath); }
-            catch { return 0; }
-            if (string.IsNullOrEmpty(root)) return 0;
-            root = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            try { root = Path.GetFullPath(Path.GetDirectoryName(executablePath)); }
+            catch
+            {
+                error = "无法确定 WeGame 安装目录。";
+                return false;
+            }
+            if (string.IsNullOrEmpty(root))
+            {
+                error = "无法确定 WeGame 安装目录。";
+                return false;
+            }
 
-            int requested = 0;
-            foreach (Process process in Process.GetProcesses())
+            List<int> initial = FindClientProcessIds(root);
+            if (initial.Count == 0) return true;
+
+            foreach (int id in initial)
             {
                 try
                 {
-                    if (process.MainWindowHandle == IntPtr.Zero) continue;
-                    string processPath = process.MainModule.FileName;
-                    if (!processPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
-                    if (process.CloseMainWindow()) requested++;
+                    using (Process process = Process.GetProcessById(id))
+                    {
+                        if (process.MainWindowHandle != IntPtr.Zero) process.CloseMainWindow();
+                    }
                 }
                 catch { }
-                finally { process.Dispose(); }
             }
-            return requested;
+            System.Threading.Thread.Sleep(1200);
+
+            foreach (int id in CollectRemainingProcessIds(initial, root))
+            {
+                try
+                {
+                    using (Process process = Process.GetProcessById(id))
+                    {
+                        process.Kill();
+                        process.WaitForExit(3000);
+                    }
+                }
+                catch { }
+            }
+            System.Threading.Thread.Sleep(300);
+
+            List<int> remaining = CollectRemainingProcessIds(initial, root);
+            closedCount = Math.Max(0, initial.Count - remaining.Count);
+            if (remaining.Count == 0) return true;
+            error = "仍有 " + remaining.Count + " 个 WeGame 客户端进程未能关闭。";
+            return false;
+        }
+
+        private static List<int> FindClientProcessIds(string installRoot)
+        {
+            List<ProcessInfo> processes = ReadProcesses();
+            HashSet<int> ids = new HashSet<int>();
+            string prefix = installRoot.TrimEnd(Path.DirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+
+            foreach (ProcessInfo info in processes)
+            {
+                if (IsService(info.Name)) continue;
+                bool isRoot = string.Equals(info.Name, "wegame.exe",
+                    StringComparison.OrdinalIgnoreCase);
+                bool isInInstallFolder = !string.IsNullOrEmpty(info.Path) &&
+                    info.Path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+                bool ownsWeGameWindow = string.Equals(info.Name, "browser.exe",
+                    StringComparison.OrdinalIgnoreCase) && HasWeGameWindow(info.Id);
+                if (isRoot || isInInstallFolder || ownsWeGameWindow) ids.Add(info.Id);
+            }
+
+            bool added;
+            do
+            {
+                added = false;
+                foreach (ProcessInfo info in processes)
+                {
+                    if (IsService(info.Name) || ids.Contains(info.Id) ||
+                        !ids.Contains(info.ParentId)) continue;
+                    ids.Add(info.Id);
+                    added = true;
+                }
+            } while (added);
+
+            return new List<int>(ids);
+        }
+
+        private static List<int> CollectRemainingProcessIds(
+            List<int> initial, string installRoot)
+        {
+            HashSet<int> remaining = new HashSet<int>(FindClientProcessIds(installRoot));
+            foreach (int id in initial)
+            {
+                try
+                {
+                    using (Process process = Process.GetProcessById(id))
+                        if (!process.HasExited) remaining.Add(id);
+                }
+                catch { }
+            }
+            return new List<int>(remaining);
+        }
+
+        private static List<ProcessInfo> ReadProcesses()
+        {
+            List<ProcessInfo> result = new List<ProcessInfo>();
+            try
+            {
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    "SELECT ProcessId, ParentProcessId, Name, ExecutablePath FROM Win32_Process"))
+                using (ManagementObjectCollection objects = searcher.Get())
+                {
+                    foreach (ManagementObject item in objects)
+                    {
+                        ProcessInfo info = new ProcessInfo();
+                        info.Id = Convert.ToInt32(item["ProcessId"], CultureInfo.InvariantCulture);
+                        info.ParentId = Convert.ToInt32(
+                            item["ParentProcessId"], CultureInfo.InvariantCulture);
+                        info.Name = Convert.ToString(item["Name"]);
+                        info.Path = Convert.ToString(item["ExecutablePath"]);
+                        result.Add(info);
+                    }
+                }
+            }
+            catch { }
+            return result;
+        }
+
+        private static bool HasWeGameWindow(int processId)
+        {
+            try
+            {
+                using (Process process = Process.GetProcessById(processId))
+                    return string.Equals(process.MainWindowTitle, "WeGame",
+                        StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        private static bool IsService(string processName)
+        {
+            return string.Equals(processName, "wegameservice.exe",
+                StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -1030,6 +1162,18 @@ namespace MonitorOSD
         public ComboBox Combo;
         public Label ValueLabel;
         public System.Windows.Forms.Timer SendTimer;
+    }
+
+    internal sealed class NoMouseWheelTrackBar : TrackBar
+    {
+        private const int WM_MOUSEWHEEL = 0x020A;
+        private const int WM_MOUSEHWHEEL = 0x020E;
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == WM_MOUSEWHEEL || message.Msg == WM_MOUSEHWHEEL) return;
+            base.WndProc(ref message);
+        }
     }
 
     internal class MainForm : Form
@@ -1361,14 +1505,18 @@ namespace MonitorOSD
                     SetStatus("正在关闭 WeGame…", 0);
                     RunBackground(delegate
                     {
-                        int requested = WeGameLocator.CloseRunningWindows(weGamePath);
+                        int closedCount;
+                        string closeError;
+                        bool closeOk = WeGameLocator.CloseRunningClient(
+                            weGamePath, out closedCount, out closeError);
                         SafeUI(delegate
                         {
                             UpdateDeltaModeButton();
-                            SetStatus(requested > 0
-                                ? "已切换至 3440×1440、125%、144Hz，并已请求关闭 WeGame。"
-                                : "已切换至 3440×1440、125%、144Hz；未发现可关闭的 WeGame 窗口。",
-                                requested > 0 ? 1 : 2);
+                            if (closeOk)
+                                SetStatus(closedCount > 0
+                                    ? "已切换至 3440×1440、125%、144Hz，并已关闭 WeGame。"
+                                    : "已切换至 3440×1440、125%、144Hz；WeGame 已处于关闭状态。", 1);
+                            else SetStatus("显示模式已切换，但关闭 WeGame 失败: " + closeError, 2);
                         });
                     });
                 });
@@ -1769,7 +1917,7 @@ namespace MonitorOSD
 
             if (row.Kind == VcpRow.KindSlider)
             {
-                TrackBar bar = new TrackBar();
+                TrackBar bar = new NoMouseWheelTrackBar();
                 bar.Minimum = 0;
                 bar.Maximum = (int)Math.Max(1, row.Max);
                 bar.TickStyle = TickStyle.None;
