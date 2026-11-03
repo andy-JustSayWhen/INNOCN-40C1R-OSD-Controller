@@ -14,6 +14,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -105,6 +106,17 @@ namespace MonitorOSD
             public int dmPanningHeight;
         }
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct DISPLAY_DEVICE
+        {
+            public int cb;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+            public int StateFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceId;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         public struct LUID
         {
@@ -155,6 +167,10 @@ namespace MonitorOSD
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool EnumDisplayDevices(
+            string deviceName, uint deviceNum, ref DISPLAY_DEVICE displayDevice, uint flags);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int ChangeDisplaySettingsEx(
@@ -215,6 +231,7 @@ namespace MonitorOSD
         public string DeviceName = "";
         public Rectangle Bounds;
         public string CapsRaw = "";
+        public string SystemModelName = "";
         public string PanelType = "";
         public string MccsVersion = "";
         public Dictionary<byte, List<uint>> Vcp = new Dictionary<byte, List<uint>>();
@@ -363,6 +380,11 @@ namespace MonitorOSD
                     dev.Bounds = Rectangle.FromLTRB(mi.rcMonitor.Left, mi.rcMonitor.Top, mi.rcMonitor.Right, mi.rcMonitor.Bottom);
                     dev.CapsRaw = ReadCaps(dev.Handle) ?? "";
                     CapsParser.Parse(dev);
+                    dev.SystemModelName = MonitorIdentity.FindFriendlyName(dev.DeviceName);
+                    if (!string.IsNullOrEmpty(dev.SystemModelName) &&
+                        (string.IsNullOrEmpty(dev.Description) ||
+                         dev.Description.IndexOf("Generic", StringComparison.OrdinalIgnoreCase) >= 0))
+                        dev.Description = dev.SystemModelName;
                     list.Add(dev);
                 }
             }
@@ -389,6 +411,52 @@ namespace MonitorOSD
         }
     }
 
+    // ----------------------------------------------- 系统显示器型号识别
+    internal static class MonitorIdentity
+    {
+        public static string FindFriendlyName(string deviceName)
+        {
+            string productId = FindProductId(deviceName);
+            if (string.IsNullOrEmpty(productId)) return "";
+            try
+            {
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    @"root\WMI", "SELECT InstanceName, UserFriendlyName FROM WmiMonitorID"))
+                using (ManagementObjectCollection objects = searcher.Get())
+                {
+                    foreach (ManagementObject item in objects)
+                    {
+                        string instanceName = Convert.ToString(item["InstanceName"]);
+                        if (instanceName.IndexOf("DISPLAY\\" + productId + "\\",
+                            StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        ushort[] chars = item["UserFriendlyName"] as ushort[];
+                        if (chars == null) continue;
+                        StringBuilder name = new StringBuilder();
+                        foreach (ushort c in chars)
+                        {
+                            if (c == 0) break;
+                            name.Append((char)c);
+                        }
+                        if (name.Length > 0) return name.ToString();
+                    }
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        private static string FindProductId(string deviceName)
+        {
+            if (string.IsNullOrEmpty(deviceName)) return "";
+            NativeMethods.DISPLAY_DEVICE display = new NativeMethods.DISPLAY_DEVICE();
+            display.cb = Marshal.SizeOf(typeof(NativeMethods.DISPLAY_DEVICE));
+            if (!NativeMethods.EnumDisplayDevices(deviceName, 0, ref display, 0)) return "";
+            string id = display.DeviceId ?? "";
+            string[] parts = id.Split('\\');
+            return parts.Length >= 2 ? parts[1] : "";
+        }
+    }
+
     // ---------------------------------------------- 三角洲 1080P 显示模式
     internal static class DeltaDisplayMode
     {
@@ -401,7 +469,8 @@ namespace MonitorOSD
         public static bool Is40C1R(MonitorDevice dev)
         {
             if (dev == null) return false;
-            return ContainsModel(dev.Description) || ContainsModel(dev.CapsRaw);
+            return ContainsModel(dev.SystemModelName) || ContainsModel(dev.Description) ||
+                ContainsModel(dev.CapsRaw);
         }
 
         private static bool ContainsModel(string text)

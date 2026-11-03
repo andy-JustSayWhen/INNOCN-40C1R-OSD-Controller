@@ -10,7 +10,7 @@ if not exist "%CSC%" (
     echo csc.exe not found
     exit /b 1
 )
-"%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 /out:"%~dp0MonitorOSD.exe" "%~dp0MonitorOSD.cs"
+"%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 /reference:System.Management.dll /out:"%~dp0MonitorOSD.exe" "%~dp0MonitorOSD.cs"
 if errorlevel 1 (
     echo Build FAILED
     exit /b 1
